@@ -1,0 +1,200 @@
+# version: '3.8'
+
+x-airflow-common:
+  &airflow-common
+  build:
+    context: .
+    dockerfile: docker/airflow/Dockerfile
+  image: ${AIRFLOW_IMAGE_NAME:-oilspill-airflow:2.8.0-custom}
+  env_file:
+    - ./.env
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres/airflow
+    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKEND: 'airflow.api.auth.backend.basic_auth'
+    PYTHONPATH: /opt/airflow
+  volumes:
+    - ./orchestration:/opt/airflow/orchestration
+    - ./orchestration/dags:/opt/airflow/dags
+    - ./orchestration/logs:/opt/airflow/logs
+    - ./orchestration/plugins:/opt/airflow/plugins
+    - ./config:/opt/airflow/config
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    &airflow-common-depends-on
+    redis:
+      condition: service_healthy
+    postgres:
+      condition: service_healthy
+
+services:
+  
+  # KAFKA
+  
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    # container_name: kafka
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: controller,broker
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+
+      KAFKA_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://0.0.0.0:29092,CONTROLLER://kafka:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+
+      CLUSTER_ID: MkU3OJKBNTcwNTJENDM2Qm
+
+  
+  # AIRFLOW
+  
+  postgres:
+    image: postgres:13
+    container_name: airflow-postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      retries: 5
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:latest
+    container_name: airflow-redis
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 30s
+      retries: 50
+    ports:
+      - "6379:6379"
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-triggerer:
+    <<: *airflow-common
+    container_name: airflow-triggerer
+    command: triggerer
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+  
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    # yamllint disable rule:line-length
+    command:
+      - -c
+      - |
+        if [[ -z "${AIRFLOW_UID}" ]]; then
+          echo
+          echo -e "\033[1;33mWARNING!!!: AIRFLOW_UID not set!\033[0m"
+          echo "If you are on Linux, you SHOULD follow the instructions below to set "
+          echo "AIRFLOW_UID environment variable, otherwise files will be owned by root."
+          echo "For example:"
+          echo "  echo 'AIRFLOW_UID=1000' >> .env"
+          echo
+        fi
+        mkdir -p /sources/logs /sources/dags /sources/plugins /sources/orchestration
+        chown -R "${AIRFLOW_UID}:0" /sources/{logs,dags,plugins,orchestration}
+        exec /entrypoint airflow version
+    # yamllint enable rule:line-length
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_UPGRADE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+    user: "0:0"
+    volumes:
+      - ./orchestration/dags:/sources/dags
+      - ./orchestration/logs:/sources/logs
+      - ./orchestration/plugins:/sources/plugins
+      - ./orchestration:/sources/orchestration
+
+  # --- AIS Microservices ---
+
+  ais-common: &ais-common
+    build: .
+    env_file:
+      - ./.env
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      kafka:
+        condition: service_started
+      redis:
+        condition: service_healthy
+
+  ais-ingestion:
+    <<: *ais-common
+    container_name: ais-ingestion
+    command: python ingestion/ais_stream/run_ingestion.py
+
+  stream-processor:
+    <<: *ais-common
+    container_name: ais-stream-processor
+    command: python services/stream_processor/main.py
+
+  anomaly-detector:
+    <<: *ais-common
+    container_name: ais-anomaly-detector
+    command: python services/anomaly_detector/main.py
+    volumes:
+      - ./preprocessing/outputs:/app/preprocessing/outputs
+
+  trigger-bridge:
+    <<: *ais-common
+    container_name: ais-trigger-bridge
+    command: python services/trigger_bridge/main.py
+
+volumes:
+  postgres-db-volume:

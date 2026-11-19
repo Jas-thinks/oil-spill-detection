@@ -1,0 +1,38 @@
+command:
+  - ${interpreter}
+  - ${program}
+  - ${args}
+program: training/unet/sweep_unet.py
+method: bayes
+metric:
+  name: val/dice
+  goal: maximize
+parameters:
+  epochs:
+    value: 12
+  encoder:
+    values: ["efficientnet-b0", "efficientnet-b3", "resnet50", "resnet101", "mit_b3", "mit_b5"]
+  image_size:
+    values: [512, 640, 768]
+  batch_size:
+    values: [8, 16, 32]
+  lr:
+    distribution: log_uniform_values
+    min: 0.00005
+    max: 0.005
+  weight_decay:
+    distribution: log_uniform_values
+    min: 0.00001
+    max: 0.01
+  dice_weight:
+    distribution: uniform
+    min: 0.2
+    max: 0.8
+  threshold:
+    distribution: uniform
+    min: 0.4
+    max: 0.6
+  seed:
+    value: 42
+  patience:
+    value: 10
